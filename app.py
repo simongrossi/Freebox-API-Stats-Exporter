@@ -1,218 +1,250 @@
-# app.py (Freebox API Stats Exporter - Version 2.1 Corrigée)
+# app.py (Freebox API Stats Exporter - v4.3 : Connexion flexible restaurée)
 import asyncio
+import platform
+import subprocess
 import json
-from urllib.parse import urlparse
 from urllib.request import urlopen
-from datetime import datetime, timezone
-from typing import List, Dict, Any, Tuple, Optional
 import pandas as pd
 import streamlit as st
 
 from freebox_api import Freepybox
 from freebox_api.exceptions import AuthorizationError
+from aiohttp import ClientConnectorError
 
-# --- Configuration & Constantes ---
+# --- Configuration de la page ---
 st.set_page_config(page_title="Freebox API Stats Exporter", page_icon="📊", layout="wide")
-APP_DESC = {
-    "app_id": "com.fase.app",
-    "app_name": "Freebox API Stats Exporter",
-    "app_version": "2.1",
-    "device_name": "FASE-Client-Robust",
-}
-DEFAULT_COLS = ["interface", "name", "host_type", "reachable", "last_activity", "days_since_last", "ipv4", "mac", "vendor"]
+st.title("📊 Freebox API Stats Exporter")
+st.caption("Explorer, filtrer et exporter les appareils Freebox — tableau, cartes, stats, WoL et ping.")
 
-# --- Helpers API & Données ---
-
+# --- Helpers (Ping & Détection API) ---
 @st.cache_data(ttl=60)
-def get_api_version_info(host: str) -> Optional[Dict[str, Any]]:
-    """Appelle http://<host>/api_version et retourne le dict (ou None)."""
+def get_api_version_info(host: str) -> dict | None:
     if not host: return None
     try:
-        with urlopen(f"http://{host}/api_version", timeout=4) as resp:
+        with urlopen(f"http://{host}/api_version", timeout=3) as resp:
             return json.load(resp)
     except Exception:
         return None
 
-def _flatten_ips(l3: Optional[List[Dict]]) -> Tuple[str, str, str]:
-    """Gère les formats d'adresse 'af' (str/int) pour extraire les IPs."""
-    if not l3: return "", "", ""
-    ipv4s = [c["addr"] for c in l3 if str(c.get("af")) in ("4", "ipv4") and c.get("addr")]
-    ipv6s = [c["addr"] for c in l3 if str(c.get("af")) in ("6", "ipv6") and c.get("addr")]
-    return ", ".join(ipv4s + ipv6s), ", ".join(ipv4s), ", ".join(ipv6s)
+try:
+    from ping3 import ping as _ping3_ping
+except Exception:
+    _ping3_ping = None
 
-def df_from_hosts(hosts: List[Dict], iface_name: str) -> pd.DataFrame:
-    """Convertit une liste de hosts JSON en DataFrame Pandas."""
-    rows = []
-    for h in hosts or []:
-        ips_all, ipv4, ipv6 = _flatten_ips(h.get("l3connectivities"))
-        ts = h.get("last_activity")
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone() if ts else None
-        days_since = (datetime.now(tz=dt.tzinfo) - dt).days if dt else None
-        rows.append({
-            "interface": iface_name, "name": h.get("primary_name"), "host_type": h.get("host_type"),
-            "reachable": h.get("reachable"), "last_activity": dt, "days_since_last": days_since,
-            "ipv4": ipv4, "ipv6": ipv6, "ips": ips_all,
-            "mac": (h.get("l2ident") or {}).get("id"), "vendor": (h.get("l2ident") or {}).get("vendor_name"), "id": h.get("id"),
-        })
-    return pd.DataFrame(rows)
+@st.cache_data(ttl=60)
+def check_ping(ip: str, timeout_sec: int = 1) -> str:
+    if not ip: return "N/A"
+    
+    def _system_ping(ip_addr: str) -> bool:
+        try:
+            param = "-n 1 -w 1000" if platform.system().lower() == "windows" else "-c 1 -W 1"
+            command = f"ping {param} {ip_addr}"
+            res = subprocess.run(command, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout_sec + 1)
+            return res.returncode == 0
+        except Exception: return False
 
-# --- Logique de Connexion Asynchrone ---
+    if _ping3_ping:
+        try:
+            if _ping3_ping(ip, timeout=timeout_sec) is not False: return "✅"
+        except Exception: pass
 
-def resolve_connection_attempts(url: str, host: str, port: int, auto: bool) -> List[Tuple[str, int, bool, str]]:
-    """Crée une liste d'essais de connexion intelligente et sans doublons."""
-    attempts = []
-    if url.strip():
-        u = urlparse(url.strip())
-        if u.hostname:
-            use_https = u.scheme == "https"
-            p = u.port or (443 if use_https else 80)
-            attempts.append((u.hostname, p, use_https, f"URL: {u.scheme}://{u.hostname}:{p}"))
-        return attempts
-    if not host.strip(): return []
-    if auto and (info := get_api_version_info(host)):
-        if (api_domain := info.get("api_domain")) and (https_port := info.get("https_port")):
-            attempts.append((api_domain, int(https_port), True, f"Auto: {api_domain}:{https_port}"))
-    if port == 80: attempts.append((host, port, False, f"Manuel (HTTP): {host}:{port}"))
-    elif port == 443: attempts.append((host, port, True, f"Manuel (HTTPS): {host}:{port}"))
-    else: attempts.append((host, port, True, f"Manuel: {host}:{port}"))
-    seen = set()
-    return [x for x in attempts if not ((x[0], x[1]) in seen or seen.add((x[0], x[1])))]
+    return "✅" if _system_ping(ip) else "❌"
 
-async def open_smart(fbx: Freepybox, attempts: list, http_fallback: bool) -> Tuple[str, int, str]:
-    """Tente de se connecter en essayant plusieurs signatures d'appel pour plus de robustesse."""
+# --- Initialisation de l'état de la session ---
+if 'fbx_client' not in st.session_state: st.session_state['fbx_client'] = None
+if 'lan_df' not in st.session_state: st.session_state['lan_df'] = None
+
+# --- Fonctions asynchrones ---
+async def open_smart(fbx: Freepybox, attempts: list):
+    """✅ CORRECTION : Tente plusieurs signatures d'appel pour une compatibilité maximale."""
+    if not attempts:
+        st.error("Aucune méthode de connexion valide n'a pu être déterminée.")
+        return
+
     for host, port, use_https, label in attempts:
-        with st.status(f"Essai : {label}", expanded=False) as status:
+        with st.spinner(f"Essai de connexion : {label}..."):
             signatures = [(host, port, use_https), (host, port), (host,)]
             for sig in signatures:
                 try:
                     await fbx.open(*sig)
-                    status.update(label=f"Succès : {label}", state="complete")
-                    return host, port, label
-                except (TypeError, ValueError): continue
-                except Exception: break
-    if http_fallback:
-        with st.status("Dernier recours : Fallback HTTP", expanded=False) as status:
-            try:
-                await fbx.open("mafreebox.freebox.fr", 80, False)
-                status.update(label="Succès : Fallback HTTP", state="complete")
-                return "mafreebox.freebox.fr", 80, "Fallback HTTP"
-            except Exception as e:
-                status.update(label="Échec : Fallback HTTP", state="error")
-                raise ConnectionError("Le fallback HTTP a échoué.") from e
+                    st.toast(f"Connecté via {label} !", icon="✅")
+                    return
+                except TypeError:
+                    # Cette signature n'est pas la bonne, on essaie la suivante
+                    continue
+                except (ClientConnectorError, ConnectionError, asyncio.TimeoutError):
+                    # C'est une vraie erreur réseau, on arrête pour cette tentative
+                    st.warning(f"Échec de la connexion réseau via {label}")
+                    break
     raise ConnectionError("Toutes les tentatives de connexion ont échoué.")
 
-async def get_interfaces_compat(fbx: Freepybox) -> list:
-    """Gère les différentes versions de nom de méthode pour les interfaces."""
-    try: return await fbx.lan.get_interfaces()
-    except AttributeError: return await fbx.lan.get_interfaces_list()
 
-async def get_hosts_compat(fbx: Freepybox, iface_name: str) -> list:
-    """Gère les différentes versions de nom de méthode pour les hosts."""
-    try: return await fbx.lan.get_hosts(iface_name)
-    except AttributeError: return await fbx.lan.get_hosts_list(iface_name)
+async def get_interfaces_compat(fbx: Freepybox):
+    return await fbx.lan.get_interfaces() if hasattr(fbx.lan, "get_interfaces") else await fbx.lan.get_interfaces_list()
 
-async def fetch_all_data(app_desc, url, host, port, auto, fallback) -> pd.DataFrame:
-    """Orchestre la connexion et la récupération des données."""
-    fbx = Freepybox(app_desc)
-    is_connected = False
+async def get_hosts_compat(fbx: Freepybox, iface_name: str):
+    return await fbx.lan.get_hosts(iface_name) if hasattr(fbx.lan, "get_hosts") else await fbx.lan.get_hosts_list(iface_name)
+
+async def wake_host(fbx: Freepybox, iface: str, mac: str):
+    if not all([fbx, iface, mac]): return False, "Informations manquantes."
+    if not hasattr(fbx.lan, "wol"): return False, "Fonction WoL non supportée."
     try:
-        attempts = resolve_connection_attempts(url, host, port, auto)
-        if not attempts and not fallback:
-             st.warning("Aucune cible de connexion définie.")
-             return pd.DataFrame()
+        await fbx.lan.wol(iface, mac)
+        return True, f"Paquet WoL envoyé à {mac}."
+    except Exception as e:
+        return False, f"Erreur WoL : {e}"
 
-        host_used, port_used, source_label = await open_smart(fbx, attempts, fallback)
-        is_connected = True
-        st.toast(f"Connecté via {host_used}:{port_used}", icon="✅")
-
-        interfaces = await get_interfaces_compat(fbx) or []
-        tasks = [get_hosts_compat(fbx, iface.get("name")) for iface in interfaces]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        parts = []
-        for i, res in enumerate(results):
-            iface_name = interfaces[i].get("name")
-            if isinstance(res, list) and not (df := df_from_hosts(res, iface_name)).empty:
-                parts.append(df)
-            elif isinstance(res, Exception):
-                st.warning(f"Erreur sur l'interface '{iface_name}': {res}")
-
-        if not parts: return pd.DataFrame()
+async def fetch_all_data(app_desc, attempts):
+    if not attempts:
+        return pd.DataFrame()
         
-        all_df = pd.concat(parts, ignore_index=True)
-        
-        # Correction du type de la colonne datetime pour éviter les erreurs .dt
-        all_df['last_activity'] = pd.to_datetime(all_df['last_activity'], errors='coerce')
-        
-        return all_df.drop_duplicates(subset=["mac", "name"], keep="first").sort_values(
-            by=["reachable", "days_since_last", "name"], ascending=[False, True, True], na_position="last"
-        )
-    finally:
-        if is_connected: await fbx.close()
+    fbx = Freepybox(app_desc)
+    await open_smart(fbx, attempts)
+    st.session_state['fbx_client'] = fbx
 
-# --- Interface Utilisateur Streamlit ---
+    interfaces = await get_interfaces_compat(fbx) or []
+    tasks = [get_hosts_compat(fbx, iface.get("name")) for iface in interfaces]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    parts = [df_from_hosts(res, interfaces[i].get("name")) for i, res in enumerate(results) if isinstance(res, list)]
+    if not parts: return pd.DataFrame()
+
+    all_df = pd.concat(parts, ignore_index=True)
+    return all_df.drop_duplicates(subset=["mac", "name"], keep="first").sort_values(
+        by=["reachable", "days_since_last", "name"], ascending=[False, True, True], na_position="last"
+    )
+
+async def close_session():
+    if st.session_state['fbx_client']:
+        try: await st.session_state['fbx_client'].close()
+        finally:
+            st.session_state['fbx_client'] = None
+            st.session_state['lan_df'] = None
+
+# --- Helpers données ---
+def df_from_hosts(hosts, iface_name):
+    rows = []
+    now = pd.Timestamp.now(tz="Europe/Paris")
+    for h in hosts or []:
+        ts, l3 = h.get("last_activity"), h.get("l3connectivities", [])
+        last_seen = pd.to_datetime(ts, unit="s", utc=True).tz_convert("Europe/Paris") if ts else pd.NaT
+        ipv4 = ", ".join(sorted([c.get("addr") for c in l3 if c.get("addr") and str(c.get("af")) in ("4", "ipv4")]))
+        rows.append({
+            "interface": iface_name, "name": h.get("primary_name"), "host_type": h.get("host_type"),
+            "reachable": h.get("reachable"), "last_activity": last_seen,
+            "days_since_last": int((now - last_seen).days) if pd.notna(last_seen) else None,
+            "ipv4": ipv4, "mac": (h.get("l2ident") or {}).get("id"), "vendor": (h.get("l2ident") or {}).get("vendor_name"),
+        })
+    return pd.DataFrame(rows)
+
+# --- Barre latérale (Sidebar) ---
 with st.sidebar:
     st.header("Connexion Freebox")
-    url_input = st.text_input("URL complète (prioritaire)", help="Ex: https://xxx.fbxos.fr:30476")
-    host_input = st.text_input("Hôte/Domaine (si URL vide)", value="mafreebox.freebox.fr")
-    port_input = st.number_input("Port (si URL vide)", value=30476, step=1)
-    c1, c2 = st.columns(2)
-    auto_detect = c1.checkbox("Auto-détecter", value=True, help="Trouver le port via /api_version")
-    allow_http_fallback = c2.checkbox("Fallback HTTP", value=True, help="Tente mafreebox.freebox.fr:80 en dernier")
-    st.divider()
-    with st.expander("Identité de l'application"):
-        APP_DESC["app_id"] = st.text_input("App ID", value=APP_DESC["app_id"])
-        APP_DESC["app_name"] = st.text_input("App Name", value=APP_DESC["app_name"])
-        APP_DESC["app_version"] = st.text_input("App Version", value=APP_DESC["app_version"])
-        APP_DESC["device_name"] = st.text_input("Device Name", value=APP_DESC["device_name"])
-    st.divider()
-    st.header("Options d’affichage")
-    default_only_reach = st.checkbox("Uniquement joignables", value=True)
-    hide_inactive_days = st.number_input("Masquer inactifs > N jours", value=0, min_value=0)
-    selected_cols = st.multiselect("Colonnes à afficher", DEFAULT_COLS + ["ips", "id", "ipv6"], default=DEFAULT_COLS)
-    
-    if st.button("Se connecter / Actualiser", type="primary", use_container_width=True):
-        st.session_state.run_fetch = True
+    if st.session_state['fbx_client']:
+        st.success("Connecté à la Freebox.")
+        if st.button("🔌 Se déconnecter"):
+            asyncio.run(close_session())
+            st.rerun()
+    else:
+        host_input = st.text_input("Hôte/Domaine", value="mafreebox.freebox.fr")
+        port_input = st.number_input("Port HTTPS", value=30476, step=1)
+        auto_detect = st.checkbox("Auto-détecter la connexion", value=True, help="Si coché, seule la détection automatique sera tentée.")
+        
+        st.divider()
+        st.header("Identité de l'application")
+        app_id = st.text_input("App ID", value="com.fase.app")
+        app_name = st.text_input("App Name", value="Freebox API Stats Exporter")
+        app_version = st.text_input("App Version", value="2.1")
+        device_name = st.text_input("Device Name", value="FASE-Client-Robust")
 
-if st.session_state.get("run_fetch", False):
-    st.session_state.run_fetch = False
-    with st.expander("Logs de connexion", expanded=True):
-        with st.spinner("Récupération des données en cours..."):
+        if st.button("🚀 Se connecter / (ré)autoriser", type="primary", use_container_width=True):
+            attempts = []
+            host = host_input.strip()
+            
+            if auto_detect:
+                info = get_api_version_info(host)
+                if info and (api_domain := info.get("api_domain")) and (https_port := info.get("https_port")):
+                    attempts.append((api_domain, int(https_port), True, f"Auto-détecté : {api_domain}"))
+                else:
+                    st.error("L'auto-détection a échoué. Vérifiez le nom d'hôte ou décochez la case pour une connexion manuelle.")
+            else:
+                attempts.append((host, int(port_input), True, f"Manuel : {host}"))
+
+            app_desc = {"app_id": app_id, "app_name": app_name, "app_version": app_version, "device_name": device_name}
             try:
-                data = asyncio.run(fetch_all_data(APP_DESC, url_input, host_input, int(port_input), auto_detect, allow_http_fallback))
-                st.session_state.lan_df = data
-                if data.empty and "lan_df" not in st.session_state:
-                     st.warning("Aucun appareil trouvé sur le réseau local.")
+                data = asyncio.run(fetch_all_data(app_desc, attempts))
+                if not data.empty or st.session_state['fbx_client']:
+                    st.session_state["lan_df"] = data
+                    st.rerun()
+            except (ClientConnectorError, ConnectionError):
+                st.error("Erreur de connexion réseau. Vérifiez l'hôte, le port et votre pare-feu.")
             except AuthorizationError:
-                st.error("Autorisation refusée. Validez la demande sur l'écran de la Freebox, puis relancez.")
+                st.error("Autorisation refusée. Validez sur l'écran de la Freebox et relancez.")
             except Exception as e:
-                st.error(f"Une erreur est survenue : {e}")
+                st.exception(e)
 
-if "lan_df" not in st.session_state or st.session_state.lan_df.empty:
-    if "lan_df" not in st.session_state:
-        st.info("Cliquez sur 'Se connecter / Actualiser' dans la barre latérale pour commencer.")
+    st.divider()
+    st.header("Filtres globaux")
+    only_reachable = st.checkbox("Uniquement joignables", value=True)
+    q = st.text_input("Recherche (nom, MAC, vendor, IP)...")
+
+# --- Affichage principal ---
+if st.session_state['lan_df'] is None:
+    st.info("Utilisez le menu latéral pour vous connecter à votre Freebox.")
 else:
-    df_source = st.session_state.lan_df
-    st.subheader("Filtres")
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
-    mask = pd.Series(True, index=df_source.index)
-    if c1.checkbox("Uniquement joignables", value=default_only_reach): mask &= df_source["reachable"]
-    if hide_inactive_days > 0: mask &= (df_source["days_since_last"].isna()) | (df_source["days_since_last"] <= hide_inactive_days)
-    if iface_filter := c2.multiselect("Interfaces", sorted(df_source["interface"].dropna().unique())): mask &= df_source["interface"].isin(iface_filter)
-    if type_filter := c3.multiselect("Types", sorted(df_source["host_type"].dropna().unique())): mask &= df_source["host_type"].isin(type_filter)
-    if q := c4.text_input("Recherche (nom/IP/MAC/vendor)…"):
-        search_mask = df_source[["name", "ips", "mac", "vendor"]].fillna("").apply(lambda col: col.str.lower().str.contains(q.lower())).any(axis=1)
-        mask &= search_mask
-    
-    df_filtered = df_source[mask]
-    st.subheader(f"Appareils affichés ({len(df_filtered)} / {len(df_source)})")
-    
-    df_display = df_filtered.copy()
-    df_display["last_activity"] = df_display["last_activity"].dt.strftime('%Y-%m-%d %H:%M:%S').fillna('')
-    
-    st.dataframe(df_display[selected_cols], use_container_width=True, hide_index=True)
-    csv = df_filtered.to_csv(index=False).encode("utf-8")
-    json_str = df_filtered.to_json(orient="records", force_ascii=False, date_format="iso")
-    c_exp1, c_exp2 = st.columns(2)
-    c_exp1.download_button("💾 Export CSV", data=csv, file_name="freebox_devices.csv", mime="text/csv", use_container_width=True)
-    c_exp2.download_button("💾 Export JSON", data=json_str, file_name="freebox_devices.json", mime="application/json", use_container_width=True)
+    df_source = st.session_state['lan_df']
+    df = df_source.copy()
+    if only_reachable: df = df[df["reachable"] == True]
+    if q:
+        ql = q.lower()
+        df = df[df.apply(lambda row: any(ql in str(row.get(col,"")).lower() for col in ["name", "mac", "vendor", "ipv4"]), axis=1)]
+
+    tab_table, tab_cards, tab_stats = st.tabs(["📋 Tableau", "🧩 Cartes", "📈 Stats"])
+    with tab_table:
+        st.subheader(f"Appareils affichés ({len(df)} / {len(df_source)})")
+        df_display = df.copy()
+        def _first_ipv4(s: str) -> str: return s.split(",")[0].strip() if s else ""
+        df_display["ping_status"] = df_display["ipv4"].apply(lambda s: check_ping(_first_ipv4(s)))
+        st.dataframe(df_display, use_container_width=True, hide_index=True)
+
+    with tab_cards:
+        st.subheader("Vue Cartes + actions WoL")
+        if df.empty: st.info("Aucun appareil à afficher avec les filtres actuels.")
+        for _, row in df.iterrows():
+            col1, col2, col3 = st.columns([2, 2, 1])
+            with col1:
+                st.markdown(f"**{row.get('name','(sans nom)')}** (`{row.get('host_type','?')}`)")
+                st.caption(f"MAC: `{row.get('mac','?')}` | Vendor: `{row.get('vendor','?')}`")
+            with col2:
+                st.markdown(f"IPv4: `{row.get('ipv4','')}`")
+                last_seen = row['last_activity'].strftime('%Y-%m-%d %H:%M:%S') if pd.notna(row['last_activity']) else 'Jamais vu'
+                st.caption(f"Interface: `{row.get('interface','?')}` | Dernière activité: {last_seen}")
+            with col3:
+                if not row.get('reachable', False):
+                    btn_key = f"wol_{row.get('mac') or row.get('name') or id(row)}"
+                    if st.button("⚡ Réveiller", key=btn_key):
+                        fbx = st.session_state.get('fbx_client')
+                        success, message = asyncio.run(wake_host(fbx, row.get('interface'), row.get('mac')))
+                        st.toast(f"✅ {message}" if success else f"❌ {message}")
+                else:
+                    st.markdown("🟢 **En ligne**")
+            st.divider()
+
+    with tab_stats:
+        st.subheader("Indicateurs (ensemble complet)")
+        total, reach = len(df_source), int(df_source['reachable'].fillna(False).sum())
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Appareils connus", total)
+        k2.metric("Joignables", reach, f"{(reach / total * 100.0) if total else 0.0:.0f}%")
+        k3.metric("Fournisseurs (vendor)", df_source['vendor'].nunique())
+        k4.metric("Interfaces", df_source['interface'].nunique())
+        st.divider()
+        cstats1, cstats2 = st.columns(2)
+        with cstats1:
+            st.markdown("**Top 10 Vendors**")
+            top_vendors = df_source['vendor'].fillna('(inconnu)').value_counts().head(10).rename_axis('vendor').reset_index(name='count')
+            st.bar_chart(top_vendors, x='vendor', y='count', use_container_width=True)
+        with cstats2:
+            st.markdown("**Appareils par interface**")
+            per_iface = df_source['interface'].fillna('(inconnue)').value_counts().rename_axis('interface').reset_index(name='count')
+            st.bar_chart(per_iface, x='interface', y='count', use_container_width=True)
