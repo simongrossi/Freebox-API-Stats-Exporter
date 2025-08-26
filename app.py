@@ -1,9 +1,10 @@
-# app.py (Freebox API Stats Exporter - v4.5 : Enrichissement du Vendor via API)
+# app.py (Freebox API Stats Exporter - v5.1 : Correction du CacheReplayClosureError)
 import asyncio
 import platform
 import subprocess
 import json
 from urllib.request import urlopen, Request
+from urllib.error import HTTPError
 import pandas as pd
 import streamlit as st
 
@@ -16,86 +17,76 @@ st.set_page_config(page_title="Freebox API Stats Exporter", page_icon="📊", la
 st.title("📊 Freebox API Stats Exporter")
 st.caption("Explorer, filtrer et exporter les appareils Freebox — tableau, cartes, stats, WoL et ping.")
 
-# --- NOUVEAU : Helper pour l'API MAC Vendor ---
-@st.cache_data(ttl=3600*24*7) # Cache le résultat pendant une semaine
-def get_vendor_from_mac(mac: str) -> str | None:
-    """Interroge l'API maclookup.app pour trouver le fabricant à partir d'une adresse MAC."""
+# --- Helpers ---
+# --- MODIFICATION : La fonction ne retourne que des données, sans appeler st.toast ---
+@st.cache_data(ttl=3600*24*7)
+def get_vendor_from_mac(mac: str) -> tuple[str | None, str | None]:
+    """
+    Interroge l'API maclookup.app.
+    Retourne un tuple (vendor, error_message).
+    L'un des deux est toujours None.
+    """
     if not mac or len(mac) < 8:
-        return None
+        return None, "Adresse MAC invalide."
     try:
-        # On utilise les 6 premiers chiffres hexadécimaux (3 octets) qui identifient le fabricant
         oui = mac.replace(":", "").replace("-", "").upper()[:6]
-        req = Request(f"https://api.maclookup.app/v2/macs/{oui}", headers={'User-Agent': 'FASE-App/1.0'})
-        with urlopen(req, timeout=3) as resp:
-            data = json.load(resp)
-            # On vérifie que la réponse est positive et contient le nom du fabricant
-            if data and data.get("success") and (vendor := data.get("vendor")):
-                return vendor
-    except Exception:
-        # En cas d'erreur (réseau, API...), on ne fait rien et on renverra None
-        pass
-    return None
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/117.0'
+        }
+        req = Request(f"https://api.maclookup.app/v2/macs/{oui}/company/name", headers=headers)
+        with urlopen(req, timeout=4) as resp:
+            vendor = resp.read().decode('utf-8').strip()
+            if vendor and vendor not in ["*NO COMPANY*", "*PRIVATE*"]:
+                return vendor, None  # Succès
+            else:
+                return None, "Fabricant non trouvé par l'API."
+    except HTTPError as e:
+        return None, f"Erreur HTTP {e.code}"
+    except Exception as e:
+        return None, f"Erreur réseau : {e}"
 
-# --- Helpers (Ping & Détection API) ---
 @st.cache_data(ttl=60)
 def get_api_version_info(host: str) -> dict | None:
     if not host: return None
     try:
         with urlopen(f"http://{host}/api_version", timeout=3) as resp:
             return json.load(resp)
-    except Exception:
-        return None
+    except Exception: return None
 
-try:
-    from ping3 import ping as _ping3_ping
-except Exception:
-    _ping3_ping = None
-
-@st.cache_data(ttl=60)
 def check_ping(ip: str, timeout_sec: int = 1) -> str:
     if not ip: return "N/A"
-    
-    def _system_ping(ip_addr: str) -> bool:
-        try:
-            param = "-n 1 -w 1000" if platform.system().lower() == "windows" else "-c 1 -W 1"
-            command = f"ping {param} {ip_addr}"
-            res = subprocess.run(command, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout_sec + 1)
-            return res.returncode == 0
-        except Exception: return False
-
-    if _ping3_ping:
-        try:
-            if _ping3_ping(ip, timeout=timeout_sec) is not False: return "✅"
-        except Exception: pass
-
-    return "✅" if _system_ping(ip) else "❌"
+    try:
+        from ping3 import ping as _ping3_ping
+        if _ping3_ping(ip, timeout=timeout_sec) is not False: return "✅"
+    except Exception: pass
+    try:
+        param = "-n 1 -w 1000" if platform.system().lower() == "windows" else "-c 1 -W 1"
+        command = f"ping {param} {ip}"
+        res = subprocess.run(command, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout_sec + 1)
+        return "✅" if res.returncode == 0 else "❌"
+    except Exception: return "❌"
 
 # --- Initialisation de l'état de la session ---
 if 'fbx_client' not in st.session_state: st.session_state['fbx_client'] = None
 if 'lan_df' not in st.session_state: st.session_state['lan_df'] = None
+if 'ping_results' not in st.session_state: st.session_state['ping_results'] = {}
 
 # --- Fonctions asynchrones ---
 async def open_smart(fbx: Freepybox, attempts: list):
-    """Tente plusieurs signatures d'appel pour une compatibilité maximale."""
     if not attempts:
         st.error("Aucune méthode de connexion valide n'a pu être déterminée.")
         return
-
     for host, port, use_https, label in attempts:
         with st.spinner(f"Essai de connexion : {label}..."):
             signatures = [(host, port, use_https), (host, port), (host,)]
             for sig in signatures:
                 try:
                     await fbx.open(*sig)
-                    st.toast(f"Connecté via {label} !", icon="✅")
-                    return
-                except TypeError:
-                    continue
+                    st.toast(f"Connecté via {label} !", icon="✅"); return
+                except TypeError: continue
                 except (ClientConnectorError, ConnectionError, asyncio.TimeoutError):
-                    st.warning(f"Échec de la connexion réseau via {label}")
-                    break
+                    st.warning(f"Échec de la connexion réseau via {label}"); break
     raise ConnectionError("Toutes les tentatives de connexion ont échoué.")
-
 
 async def get_interfaces_compat(fbx: Freepybox):
     return await fbx.lan.get_interfaces() if hasattr(fbx.lan, "get_interfaces") else await fbx.lan.get_interfaces_list()
@@ -107,26 +98,19 @@ async def wake_host(fbx: Freepybox, iface: str, mac: str):
     if not all([fbx, iface, mac]): return False, "Informations manquantes."
     if not hasattr(fbx.lan, "wol"): return False, "Fonction WoL non supportée."
     try:
-        await fbx.lan.wol(iface, mac)
-        return True, f"Paquet WoL envoyé à {mac}."
-    except Exception as e:
-        return False, f"Erreur WoL : {e}"
+        await fbx.lan.wol(iface, mac); return True, f"Paquet WoL envoyé à {mac}."
+    except Exception as e: return False, f"Erreur WoL : {e}"
 
 async def fetch_all_data(app_desc, attempts):
-    if not attempts:
-        return pd.DataFrame()
-        
+    if not attempts: return pd.DataFrame()
     fbx = Freepybox(app_desc)
     await open_smart(fbx, attempts)
     st.session_state['fbx_client'] = fbx
-
     interfaces = await get_interfaces_compat(fbx) or []
     tasks = [get_hosts_compat(fbx, iface.get("name")) for iface in interfaces]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-
     parts = [df_from_hosts(res, interfaces[i].get("name")) for i, res in enumerate(results) if isinstance(res, list)]
     if not parts: return pd.DataFrame()
-
     all_df = pd.concat(parts, ignore_index=True)
     return all_df.drop_duplicates(subset=["mac", "name"], keep="first").sort_values(
         by=["reachable", "days_since_last", "name"], ascending=[False, True, True], na_position="last"
@@ -138,6 +122,7 @@ async def close_session():
         finally:
             st.session_state['fbx_client'] = None
             st.session_state['lan_df'] = None
+            st.session_state['ping_results'] = {}
 
 # --- Helpers données ---
 def df_from_hosts(hosts, iface_name):
@@ -148,15 +133,7 @@ def df_from_hosts(hosts, iface_name):
         last_seen = pd.to_datetime(ts, unit="s", utc=True).tz_convert("Europe/Paris") if ts else pd.NaT
         ipv4 = ", ".join(sorted([c.get("addr") for c in l3 if c.get("addr") and str(c.get("af")) in ("4", "ipv4")]))
         mac = (h.get("l2ident") or {}).get("id")
-        
-        # --- NOUVEAU : Logique d'enrichissement du Vendor ---
         vendor = (h.get("l2ident") or {}).get("vendor_name")
-        # Si le vendor est manquant ou générique, on tente une recherche externe
-        if not vendor or vendor.lower() in ["(unknown)", "unknown"]:
-            api_vendor = get_vendor_from_mac(mac)
-            if api_vendor:
-                vendor = api_vendor
-
         rows.append({
             "interface": iface_name, "name": h.get("primary_name"), "host_type": h.get("host_type"),
             "reachable": h.get("reachable"), "last_activity": last_seen,
@@ -168,56 +145,45 @@ def df_from_hosts(hosts, iface_name):
 # --- Barre latérale (Sidebar) ---
 with st.sidebar:
     st.header("Connexion Freebox")
-    if st.session_state['fbx_client']:
+    if st.session_state.get('fbx_client'):
         st.success("Connecté à la Freebox.")
         if st.button("🔌 Se déconnecter"):
-            asyncio.run(close_session())
-            st.rerun()
+            asyncio.run(close_session()); st.rerun()
     else:
         host_input = st.text_input("Hôte/Domaine", value="mafreebox.freebox.fr")
         port_input = st.number_input("Port HTTPS", value=30476, step=1)
-        auto_detect = st.checkbox("Auto-détecter la connexion", value=True, help="Si coché, seule la détection automatique sera tentée.")
-        
+        auto_detect = st.checkbox("Auto-détecter la connexion", value=True)
         st.divider()
         st.header("Identité de l'application")
         app_id = st.text_input("App ID", value="com.fase.app")
         app_name = st.text_input("App Name", value="Freebox API Stats Exporter")
-        app_version = st.text_input("App Version", value="2.1")
-        device_name = st.text_input("Device Name", value="FASE-Client-Robust")
-
+        app_version = st.text_input("App Version", value="3.0")
+        device_name = st.text_input("Device Name", value="FASE-Client-Advanced")
         if st.button("🚀 Se connecter / (ré)autoriser", type="primary", use_container_width=True):
             attempts = []
             host = host_input.strip()
-            
             if auto_detect:
                 info = get_api_version_info(host)
                 if info and (api_domain := info.get("api_domain")) and (https_port := info.get("https_port")):
                     attempts.append((api_domain, int(https_port), True, f"Auto-détecté : {api_domain}"))
-                else:
-                    st.error("L'auto-détection a échoué. Vérifiez le nom d'hôte ou décochez la case pour une connexion manuelle.")
-            else:
-                attempts.append((host, int(port_input), True, f"Manuel : {host}"))
-
+                else: st.error("L'auto-détection a échoué.")
+            else: attempts.append((host, int(port_input), True, f"Manuel : {host}"))
             app_desc = {"app_id": app_id, "app_name": app_name, "app_version": app_version, "device_name": device_name}
             try:
-                data = asyncio.run(fetch_all_data(app_desc, attempts))
-                if not data.empty or st.session_state['fbx_client']:
-                    st.session_state["lan_df"] = data
-                    st.rerun()
-            except AuthorizationError:
-                st.error("🔴 Autorisation refusée. Veuillez valider la demande sur l'écran de la Freebox, puis réessayez.")
-            except (ClientConnectorError, ConnectionError):
-                st.error("🔌 Erreur de connexion réseau. Vérifiez l'hôte, le port et votre pare-feu.")
-            except Exception as e:
-                st.exception(e)
-
+                with st.spinner("Récupération des données..."):
+                    data = asyncio.run(fetch_all_data(app_desc, attempts))
+                if not data.empty or st.session_state.get('fbx_client'):
+                    st.session_state["lan_df"] = data; st.rerun()
+            except AuthorizationError: st.error("🔴 Autorisation refusée. Validez sur l'écran de la Freebox.")
+            except (ClientConnectorError, ConnectionError): st.error("🔌 Erreur de connexion réseau.")
+            except Exception as e: st.exception(e)
     st.divider()
     st.header("Filtres globaux")
     only_reachable = st.checkbox("Uniquement joignables", value=True)
     q = st.text_input("Recherche (nom, MAC, vendor, IP)...")
 
 # --- Affichage principal ---
-if st.session_state['lan_df'] is None:
+if 'lan_df' not in st.session_state or st.session_state['lan_df'] is None:
     st.info("Utilisez le menu latéral pour vous connecter à votre Freebox.")
 else:
     df_source = st.session_state['lan_df']
@@ -227,75 +193,109 @@ else:
         ql = q.lower()
         df = df[df.apply(lambda row: any(ql in str(row.get(col,"")).lower() for col in ["name", "mac", "vendor", "ipv4"]), axis=1)]
 
-    tab_table, tab_cards, tab_stats = st.tabs(["📋 Tableau", "🧩 Cartes", "📈 Stats"])
+    tab_table, tab_cards, tab_vendor_stats = st.tabs(["📋 Tableau", "🧩 Cartes & Actions", "🔍 Fabricants & Stats"])
+
     with tab_table:
         st.subheader(f"Appareils affichés ({len(df)} / {len(df_source)})")
         df_display = df.copy()
-        def _first_ipv4(s: str) -> str: return s.split(",")[0].strip() if s else ""
-        df_display["ping_status"] = df_display["ipv4"].apply(lambda s: check_ping(_first_ipv4(s)))
+        if st.button("📡 Lancer un ping sur les appareils affichés"):
+            progress_bar = st.progress(0, "Pinging appareils...")
+            ping_results = {}
+            for i, row in enumerate(df_display.itertuples()):
+                first_ip = getattr(row, "ipv4", "").split(",")[0].strip()
+                if first_ip: ping_results[row.mac] = check_ping(first_ip)
+                progress_bar.progress((i + 1) / len(df_display), f"Pinging {row.name}...")
+            st.session_state.ping_results.update(ping_results)
+            progress_bar.empty(); st.toast("Ping terminé !")
+        if st.session_state.ping_results:
+            df_display['ping_status'] = df_display['mac'].map(st.session_state.ping_results).fillna("N/A")
         st.dataframe(df_display, use_container_width=True, hide_index=True)
-
-        # --- Boutons d'export ---
         st.divider()
-        col_export1, col_export2 = st.columns(2)
-        with col_export1:
-            st.download_button(
-                label="📥 Exporter en CSV",
-                data=df_display.to_csv(index=False).encode('utf-8'),
-                file_name='freebox_devices.csv',
-                mime='text/csv',
-                use_container_width=True
-            )
-        with col_export2:
-            st.download_button(
-                label="📥 Exporter en JSON",
-                data=df_display.to_json(orient='records', indent=4).encode('utf-8'),
-                file_name='freebox_devices.json',
-                mime='application/json',
-                use_container_width=True
-            )
-
+        c1, c2 = st.columns(2)
+        c1.download_button("📥 Exporter en CSV", df_display.to_csv(index=False).encode('utf-8'), 'freebox.csv', 'text/csv', use_container_width=True)
+        c2.download_button("📥 Exporter en JSON", df_display.to_json(orient='records').encode('utf-8'), 'freebox.json', 'application/json', use_container_width=True)
 
     with tab_cards:
-        st.subheader("Vue Cartes + actions WoL")
+        st.subheader("Actions individuelles par appareil")
         if df.empty: st.info("Aucun appareil à afficher avec les filtres actuels.")
-        for _, row in df.iterrows():
-            col1, col2, col3 = st.columns([2, 2, 1])
-            with col1:
-                st.markdown(f"**{row.get('name','(sans nom)')}** (`{row.get('host_type','?')}`)")
-                st.caption(f"MAC: `{row.get('mac','?')}` | Vendor: `{row.get('vendor','?')}`")
-            with col2:
-                st.markdown(f"IPv4: `{row.get('ipv4','')}`")
-                last_seen = row['last_activity'].strftime('%Y-%m-%d %H:%M:%S') if pd.notna(row['last_activity']) else 'Jamais vu'
-                st.caption(f"Interface: `{row.get('interface','?')}` | Dernière activité: {last_seen}")
-            with col3:
-                if not row.get('reachable', False):
-                    btn_key = f"wol_{row.get('mac') or row.get('name') or id(row)}"
-                    if st.button("⚡ Réveiller", key=btn_key):
-                        # --- Feedback Spinner WoL ---
-                        with st.spinner("Envoi du paquet WoL..."):
-                            fbx = st.session_state.get('fbx_client')
-                            success, message = asyncio.run(wake_host(fbx, row.get('interface'), row.get('mac')))
-                            st.toast(f"✅ {message}" if success else f"❌ {message}")
-                else:
-                    st.markdown("🟢 **En ligne**")
-            st.divider()
+        for index, row in df.iterrows():
+            mac = row.get('mac')
+            is_vendor_known = row.get("vendor") and row.get("vendor").lower() not in ["(unknown)", "unknown", ""]
+            with st.container(border=True):
+                c1, c2 = st.columns([3, 1])
+                with c1:
+                    st.markdown(f"**{row.get('name','(sans nom)')}** (`{row.get('host_type','?')}`)")
+                    st.caption(f"MAC: `{mac}` | IP: `{row.get('ipv4','')}`")
+                    
+                    vc1, vc2 = st.columns([2,1])
+                    with vc1:
+                        st.markdown(f"Fabricant : **{row.get('vendor') or '(inconnu)'}**")
+                    if not is_vendor_known:
+                        with vc2:
+                            if st.button("🔍 Chercher", key=f"vendor_{mac}", help="Rechercher le fabricant via l'API"):
+                                with st.spinner("Recherche..."):
+                                    # --- MODIFICATION : Interprétation du résultat de la fonction ---
+                                    new_vendor, error = get_vendor_from_mac(mac)
+                                    if new_vendor:
+                                        st.session_state.lan_df.loc[st.session_state.lan_df['mac'] == mac, 'vendor'] = new_vendor
+                                        st.rerun()
+                                    else:
+                                        st.toast(error, icon="❌")
+                with c2:
+                    st.write("")
+                    if st.button("Ping 📡", key=f"ping_{mac}"):
+                        first_ip = row.get("ipv4", "").split(",")[0].strip()
+                        if first_ip: st.toast(f"Ping {row['name']} ({first_ip}): {check_ping(first_ip)}")
+                        else: st.toast("Aucune adresse IP à pinger.", icon="⚠️")
+                    if not row.get('reachable', False):
+                        if st.button("Réveiller ⚡", key=f"wol_{mac}"):
+                             with st.spinner("Envoi..."):
+                                fbx = st.session_state.get('fbx_client')
+                                success, msg = asyncio.run(wake_host(fbx, row.get('interface'), mac))
+                                st.toast(msg, icon="✅" if success else "❌")
+                    else: st.success("En ligne")
 
-    with tab_stats:
-        st.subheader("Indicateurs (ensemble complet)")
+    with tab_vendor_stats:
+        st.subheader("Gestion des Fabricants (Vendors)")
+        unknown_vendor_df = df_source[
+            df_source['vendor'].isnull() |
+            df_source['vendor'].str.lower().isin(["(unknown)", "unknown", ""])
+        ]
+        nb_unknown = len(unknown_vendor_df)
+        col1, col2 = st.columns(2)
+        col1.metric("Fabricants inconnus", nb_unknown)
+        with col2:
+            st.write("")
+            if st.button("🤖 Enrichir les fabricants inconnus", disabled=nb_unknown == 0, type="primary"):
+                progress_bar = st.progress(0, "Recherche des fabricants...")
+                updated_count = 0
+                for i, row in enumerate(unknown_vendor_df.itertuples()):
+                    mac = row.mac
+                    progress_bar.progress((i + 1) / nb_unknown, f"Recherche pour {row.name} ({mac})...")
+                    # --- MODIFICATION : Interprétation du résultat ici aussi ---
+                    new_vendor, error = get_vendor_from_mac(mac)
+                    if new_vendor:
+                        st.session_state.lan_df.loc[st.session_state.lan_df['mac'] == mac, 'vendor'] = new_vendor
+                        updated_count += 1
+                progress_bar.empty()
+                st.toast(f"{updated_count} fabricant(s) trouvé(s) et mis(es) à jour !", icon="✨")
+                st.rerun()
+
+        st.divider()
+        st.subheader("Statistiques Générales")
         total, reach = len(df_source), int(df_source['reachable'].fillna(False).sum())
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Appareils connus", total)
         k2.metric("Joignables", reach, f"{(reach / total * 100.0) if total else 0.0:.0f}%")
-        k3.metric("Fournisseurs (vendor)", df_source['vendor'].nunique())
+        k3.metric("Fabricants identifiés", df_source['vendor'].nunique())
         k4.metric("Interfaces", df_source['interface'].nunique())
         st.divider()
         cstats1, cstats2 = st.columns(2)
         with cstats1:
-            st.markdown("**Top 10 Vendors**")
+            st.markdown("**Top 10 Fabricants**")
             top_vendors = df_source['vendor'].fillna('(inconnu)').value_counts().head(10).rename_axis('vendor').reset_index(name='count')
-            st.bar_chart(top_vendors, x='vendor', y='count', use_container_width=True)
+            st.bar_chart(top_vendors, x='vendor', y='count')
         with cstats2:
             st.markdown("**Appareils par interface**")
             per_iface = df_source['interface'].fillna('(inconnue)').value_counts().rename_axis('interface').reset_index(name='count')
-            st.bar_chart(per_iface, x='interface', y='count', use_container_width=True)
+            st.bar_chart(per_iface, x='interface', y='count')
