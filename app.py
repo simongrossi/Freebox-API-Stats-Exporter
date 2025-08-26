@@ -1,4 +1,4 @@
-# app.py (Freebox API Stats Exporter - v4.3 : Connexion flexible restaurée)
+# app.py (Freebox API Stats Exporter - v4.4 : Ajout Export & Amélioration Feedback)
 import asyncio
 import platform
 import subprocess
@@ -56,7 +56,7 @@ if 'lan_df' not in st.session_state: st.session_state['lan_df'] = None
 
 # --- Fonctions asynchrones ---
 async def open_smart(fbx: Freepybox, attempts: list):
-    """✅ CORRECTION : Tente plusieurs signatures d'appel pour une compatibilité maximale."""
+    """Tente plusieurs signatures d'appel pour une compatibilité maximale."""
     if not attempts:
         st.error("Aucune méthode de connexion valide n'a pu être déterminée.")
         return
@@ -70,10 +70,8 @@ async def open_smart(fbx: Freepybox, attempts: list):
                     st.toast(f"Connecté via {label} !", icon="✅")
                     return
                 except TypeError:
-                    # Cette signature n'est pas la bonne, on essaie la suivante
                     continue
                 except (ClientConnectorError, ConnectionError, asyncio.TimeoutError):
-                    # C'est une vraie erreur réseau, on arrête pour cette tentative
                     st.warning(f"Échec de la connexion réseau via {label}")
                     break
     raise ConnectionError("Toutes les tentatives de connexion ont échoué.")
@@ -176,10 +174,10 @@ with st.sidebar:
                 if not data.empty or st.session_state['fbx_client']:
                     st.session_state["lan_df"] = data
                     st.rerun()
-            except (ClientConnectorError, ConnectionError):
-                st.error("Erreur de connexion réseau. Vérifiez l'hôte, le port et votre pare-feu.")
             except AuthorizationError:
-                st.error("Autorisation refusée. Validez sur l'écran de la Freebox et relancez.")
+                st.error("🔴 Autorisation refusée. Veuillez valider la demande sur l'écran de la Freebox, puis réessayez.")
+            except (ClientConnectorError, ConnectionError):
+                st.error("🔌 Erreur de connexion réseau. Vérifiez l'hôte, le port et votre pare-feu.")
             except Exception as e:
                 st.exception(e)
 
@@ -207,6 +205,27 @@ else:
         df_display["ping_status"] = df_display["ipv4"].apply(lambda s: check_ping(_first_ipv4(s)))
         st.dataframe(df_display, use_container_width=True, hide_index=True)
 
+        # --- NOUVEAU : Boutons d'export ---
+        st.divider()
+        col_export1, col_export2 = st.columns(2)
+        with col_export1:
+            st.download_button(
+                label="📥 Exporter en CSV",
+                data=df_display.to_csv(index=False).encode('utf-8'),
+                file_name='freebox_devices.csv',
+                mime='text/csv',
+                use_container_width=True
+            )
+        with col_export2:
+            st.download_button(
+                label="📥 Exporter en JSON",
+                data=df_display.to_json(orient='records', indent=4).encode('utf-8'),
+                file_name='freebox_devices.json',
+                mime='application/json',
+                use_container_width=True
+            )
+
+
     with tab_cards:
         st.subheader("Vue Cartes + actions WoL")
         if df.empty: st.info("Aucun appareil à afficher avec les filtres actuels.")
@@ -223,9 +242,11 @@ else:
                 if not row.get('reachable', False):
                     btn_key = f"wol_{row.get('mac') or row.get('name') or id(row)}"
                     if st.button("⚡ Réveiller", key=btn_key):
-                        fbx = st.session_state.get('fbx_client')
-                        success, message = asyncio.run(wake_host(fbx, row.get('interface'), row.get('mac')))
-                        st.toast(f"✅ {message}" if success else f"❌ {message}")
+                        # --- NOUVEAU : Feedback Spinner WoL ---
+                        with st.spinner("Envoi du paquet WoL..."):
+                            fbx = st.session_state.get('fbx_client')
+                            success, message = asyncio.run(wake_host(fbx, row.get('interface'), row.get('mac')))
+                            st.toast(f"✅ {message}" if success else f"❌ {message}")
                 else:
                     st.markdown("🟢 **En ligne**")
             st.divider()
