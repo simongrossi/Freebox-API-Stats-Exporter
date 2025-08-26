@@ -79,17 +79,20 @@ chmod +x setup.sh
 
 ---
 
-## ⚠️ Notes importantes
+## ⚙️ Identité de l'application
 
-- **Autorisation initiale** : si l’authentification HTTPS échoue la toute première fois (certificat non reconnu), lance en HTTP local pour autoriser :
-  - host = `mafreebox.freebox.fr`
-  - port = `80`
-  - HTTPS désactivé
-- Après autorisation, reviens sur ton domaine HTTPS (ex. `xxx.fbxos.fr:30476`).
+Par défaut, l’application utilise ces identifiants fixes :
 
-- **Token** : le jeton d’application est stocké par `freebox-api` dans ton profil utilisateur. Si tu modifies `app_id`, il faudra re-autoriser sur la Freebox.
+- **App ID** : `com.fase.app`  
+- **App Name** : `Freebox API Stats Exporter`  
+- **App Version** : `1.0`  
+- **Device Name** : `FASE-Client`  
 
-- **Confidentialité** : le projet utilise des **valeurs génériques** par défaut (host/app_id) afin d'éviter d'exposer ta config. Remplace-les dans l'interface Streamlit au moment de te connecter.
+👉 Ces valeurs sont suffisantes pour utiliser l’application.  
+Vous pouvez les modifier si vous voulez personnaliser l’identifiant ou différencier vos appareils.  
+⚠️ Attention : si vous changez **App ID** ou **Device Name**, la Freebox considérera qu’il s’agit d’une **nouvelle application** et vous devrez valider une nouvelle autorisation sur l’écran.
+
+---
 
 ## 📂 Structure du projet
 
