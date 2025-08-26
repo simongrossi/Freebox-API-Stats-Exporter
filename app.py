@@ -1,9 +1,9 @@
-# app.py (Freebox API Stats Exporter - v4.4 : Ajout Export & Amélioration Feedback)
+# app.py (Freebox API Stats Exporter - v4.5 : Enrichissement du Vendor via API)
 import asyncio
 import platform
 import subprocess
 import json
-from urllib.request import urlopen
+from urllib.request import urlopen, Request
 import pandas as pd
 import streamlit as st
 
@@ -15,6 +15,26 @@ from aiohttp import ClientConnectorError
 st.set_page_config(page_title="Freebox API Stats Exporter", page_icon="📊", layout="wide")
 st.title("📊 Freebox API Stats Exporter")
 st.caption("Explorer, filtrer et exporter les appareils Freebox — tableau, cartes, stats, WoL et ping.")
+
+# --- NOUVEAU : Helper pour l'API MAC Vendor ---
+@st.cache_data(ttl=3600*24*7) # Cache le résultat pendant une semaine
+def get_vendor_from_mac(mac: str) -> str | None:
+    """Interroge l'API maclookup.app pour trouver le fabricant à partir d'une adresse MAC."""
+    if not mac or len(mac) < 8:
+        return None
+    try:
+        # On utilise les 6 premiers chiffres hexadécimaux (3 octets) qui identifient le fabricant
+        oui = mac.replace(":", "").replace("-", "").upper()[:6]
+        req = Request(f"https://api.maclookup.app/v2/macs/{oui}", headers={'User-Agent': 'FASE-App/1.0'})
+        with urlopen(req, timeout=3) as resp:
+            data = json.load(resp)
+            # On vérifie que la réponse est positive et contient le nom du fabricant
+            if data and data.get("success") and (vendor := data.get("vendor")):
+                return vendor
+    except Exception:
+        # En cas d'erreur (réseau, API...), on ne fait rien et on renverra None
+        pass
+    return None
 
 # --- Helpers (Ping & Détection API) ---
 @st.cache_data(ttl=60)
@@ -127,11 +147,21 @@ def df_from_hosts(hosts, iface_name):
         ts, l3 = h.get("last_activity"), h.get("l3connectivities", [])
         last_seen = pd.to_datetime(ts, unit="s", utc=True).tz_convert("Europe/Paris") if ts else pd.NaT
         ipv4 = ", ".join(sorted([c.get("addr") for c in l3 if c.get("addr") and str(c.get("af")) in ("4", "ipv4")]))
+        mac = (h.get("l2ident") or {}).get("id")
+        
+        # --- NOUVEAU : Logique d'enrichissement du Vendor ---
+        vendor = (h.get("l2ident") or {}).get("vendor_name")
+        # Si le vendor est manquant ou générique, on tente une recherche externe
+        if not vendor or vendor.lower() in ["(unknown)", "unknown"]:
+            api_vendor = get_vendor_from_mac(mac)
+            if api_vendor:
+                vendor = api_vendor
+
         rows.append({
             "interface": iface_name, "name": h.get("primary_name"), "host_type": h.get("host_type"),
             "reachable": h.get("reachable"), "last_activity": last_seen,
             "days_since_last": int((now - last_seen).days) if pd.notna(last_seen) else None,
-            "ipv4": ipv4, "mac": (h.get("l2ident") or {}).get("id"), "vendor": (h.get("l2ident") or {}).get("vendor_name"),
+            "ipv4": ipv4, "mac": mac, "vendor": vendor,
         })
     return pd.DataFrame(rows)
 
@@ -205,7 +235,7 @@ else:
         df_display["ping_status"] = df_display["ipv4"].apply(lambda s: check_ping(_first_ipv4(s)))
         st.dataframe(df_display, use_container_width=True, hide_index=True)
 
-        # --- NOUVEAU : Boutons d'export ---
+        # --- Boutons d'export ---
         st.divider()
         col_export1, col_export2 = st.columns(2)
         with col_export1:
@@ -242,7 +272,7 @@ else:
                 if not row.get('reachable', False):
                     btn_key = f"wol_{row.get('mac') or row.get('name') or id(row)}"
                     if st.button("⚡ Réveiller", key=btn_key):
-                        # --- NOUVEAU : Feedback Spinner WoL ---
+                        # --- Feedback Spinner WoL ---
                         with st.spinner("Envoi du paquet WoL..."):
                             fbx = st.session_state.get('fbx_client')
                             success, message = asyncio.run(wake_host(fbx, row.get('interface'), row.get('mac')))
