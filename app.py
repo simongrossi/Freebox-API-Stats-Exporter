@@ -1,4 +1,4 @@
-# app.py (Freebox API Stats Exporter - generic defaults)
+# app.py (Freebox API Stats Exporter - fixed generic identity)
 import asyncio
 from datetime import datetime, timezone
 import pandas as pd
@@ -14,19 +14,18 @@ st.caption("Explorer, filtrer et exporter les appareils Freebox — avec vues st
 # ---------- Sidebar: Connexion & options ----------
 with st.sidebar:
     st.header("Connexion Freebox")
-    # Valeurs génériques pour éviter d'exposer une config perso dans le code public
-    # Remplacez par votre domaine si besoin (ex. xxx.fbxos.fr) OU utilisez mafreebox.freebox.fr
+    # Valeurs génériques par défaut
     host_https = st.text_input("Hôte/Domaine", value="mafreebox.freebox.fr")
     port_https = st.number_input("Port HTTPS", value=30476, step=1)
     # Astuce première autorisation : mafreebox.freebox.fr:80 en HTTP si besoin
 
     st.divider()
     st.header("Identité de l'application")
-    # Idem, valeurs génériques : à personnaliser si vous le souhaitez
-    app_id = st.text_input("App ID", value="com.example.fase")
+    # Valeurs fixes génériques pour l'identité de l'application
+    app_id = st.text_input("App ID", value="com.fase.app")
     app_name = st.text_input("App Name", value="Freebox API Stats Exporter")
     app_version = st.text_input("App Version", value="1.0")
-    device_name = st.text_input("Device Name", value="My-Computer")
+    device_name = st.text_input("Device Name", value="FASE-Client")
 
     st.divider()
     st.header("Options d’affichage")
@@ -38,38 +37,30 @@ with st.sidebar:
 
 # ---------- Helpers (compat signatures/méthodes) ----------
 async def open_compat(fbx: Freepybox, host_https: str, port_https: int):
-    """Ouvre une session en essayant plusieurs signatures d'open().
-    Cette compatibilité couvre différentes versions de freebox-api.
-    """
-    # 1) host seul
+    """Ouvre une session en essayant plusieurs signatures d'open()."""
     try:
         await fbx.open(host_https)
         return
     except TypeError:
         pass
-    # 2) host + port
     try:
         await fbx.open(host_https, port_https)
         return
     except TypeError:
         pass
-    # 3) host + port + https=True
     try:
         await fbx.open(host_https, port_https, True)
         return
     except Exception:
-        # 4) Dernier recours : HTTP local pour autorisation initiale
         await fbx.open("mafreebox.freebox.fr", 80, False)
 
 async def get_interfaces_compat(fbx: Freepybox):
-    """Compat: selon versions -> get_interfaces() ou get_interfaces_list()."""
     try:
         return await fbx.lan.get_interfaces()
     except AttributeError:
         return await fbx.lan.get_interfaces_list()
 
 async def get_hosts_compat(fbx: Freepybox, iface_name: str):
-    """Compat: selon versions -> get_hosts() ou get_hosts_list()."""
     try:
         return await fbx.lan.get_hosts(iface_name)
     except AttributeError:
@@ -124,7 +115,6 @@ async def fetch_all(app_desc, host, port):
     fbx = Freepybox(app_desc)
     try:
         await open_compat(fbx, host, port)
-
         interfaces = await get_interfaces_compat(fbx) or []
         parts = []
         for iface in interfaces:
@@ -136,19 +126,15 @@ async def fetch_all(app_desc, host, port):
             df = df_from_hosts(hosts, name)
             if not df.empty:
                 parts.append(df)
-
         if parts:
             all_df = pd.concat(parts, ignore_index=True)
-            # dédoublonnage prudent
             all_df = all_df.drop_duplicates(subset=["interface","mac","ips"], keep="first")
-            # tri sympa : joignables, puis récents
             all_df = all_df.sort_values(
                 by=["reachable","days_since_last","name"],
                 ascending=[False, True, True],
                 na_position="last",
             )
             return all_df
-
         return pd.DataFrame(columns=["interface","name","host_type","reachable","last_activity",
                                      "days_since_last","ipv4","ipv6","ips","mac","vendor","id"])
     finally:
