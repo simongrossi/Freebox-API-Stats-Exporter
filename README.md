@@ -1,77 +1,69 @@
-# 📊 Freebox API Stats Exporter (Streamlit)
 
-Explorez les appareils connectés à votre Freebox, filtrez, exportez (CSV/JSON) et affichez des statistiques — le tout via Streamlit.
+# 📊 Freebox API Stats Exporter (FASE)
 
-> **FASE** — Freebox API Stats Exporter
+Une application **Streamlit** pour explorer, filtrer et exporter la liste des appareils connectés à votre Freebox.
+
+---
 
 ## ✨ Fonctionnalités
 
-- Connexion à l’API Freebox OS via [freebox-api](https://github.com/hacf-fr/freebox-api)
-- Découverte des **interfaces LAN** (ex. `pub`, `wifiguest`)
-- Liste des appareils par interface :
-  - Nom, type (`host_type`)
-  - IP v4/v6
-  - MAC + vendor
-  - Dernière activité (date + nombre de jours)
-  - Statut `reachable` (joignable ou non)
-- Filtres :
-  - Joignables uniquement
-  - Interfaces spécifiques
-  - Types d’hôtes
-  - Recherche plein-texte (nom, IP, MAC, vendor…)
-- Export CSV et JSON
+- 🔐 **Connexion sécurisée** à l’API de Freebox OS via [`freebox-api`](https://github.com/hacf-fr/freebox-api).  
+- 🛰️ **Découverte automatique** des paramètres (`https_port`, `api_domain`, version API, modèle) grâce à l’endpoint `/api_version`.  
+- 🌐 **Fallback intelligent** : tentative sur différents hôtes (`api_domain`, `mafreebox.freebox.fr`, `192.168.1.254`, `freebox.home`…), utile en cas de DNS ou réseau particulier.  
+- 📋 **Liste détaillée des appareils** par interface (LAN, Wi-Fi invité, etc.) avec :  
+  - Nom et type (`host_type`)  
+  - Adresses IPv4 et IPv6  
+  - Adresse MAC et fabricant  
+  - Date + ancienneté de la dernière activité  
+  - Statut de connectivité (joignable ou non)  
+- 🔎 **Filtres avancés** :  
+  - Statut (joignables uniquement)  
+  - Interfaces réseau  
+  - Types d’appareils  
+  - Recherche plein texte (nom, IP, MAC, vendor…)  
+- 📤 **Export simple** des données filtrées aux formats **CSV** et **JSON**.  
+
+---
 
 ## 📦 Installation
 
 ### 1. Cloner le dépôt
-
 ```bash
-git clone https://github.com/<ton-user>/freebox-api-stats-exporter.git
+git clone https://github.com/your-username/freebox-api-stats-exporter.git
 cd freebox-api-stats-exporter
 ```
 
 ### 2. Installer les dépendances
+Le script utilise les bibliothèques Python listées dans `requirements.txt`.
 
-#### Linux / macOS
+- **Linux / macOS** :
 ```bash
 python3 -m pip install -r requirements.txt
 ```
 
-#### Windows
+- **Windows (PowerShell)** :
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-## ▶️ Utilisation
+---
 
-### 🔎 Test rapide de connexion
+## ▶️ Lancement
 
+### 🚀 Lancer l'application Streamlit
 ```bash
-python quick_test.py
+streamlit run app.py
 ```
+Puis ouvrez l’adresse [http://localhost:8501](http://localhost:8501) dans votre navigateur.
 
-- La première fois, la Freebox affichera une **demande d’autorisation** : valide sur l’écran tactile.
-- Le token est stocké localement par la librairie et sera réutilisé.
-- Exemple de sortie :
-  ```
-  Interfaces: ['pub', 'wifiguest']
-  Hôtes sur pub : 76
-  ```
+ℹ️ **Première connexion** : la Freebox affichera une demande d’autorisation sur son écran. Vous devrez la valider pour que l’application puisse accéder à l’API.
 
-### 🚀 Lancer l’application Streamlit
+---
 
-```bash
-python -m streamlit run app.py
-```
+### ⚡ Scripts de démarrage rapide
 
-Ouvre ensuite http://localhost:8501 dans ton navigateur.
-
-### 💻 Windows (setup.bat)
-
-Double-clique sur `setup.bat` pour installer les dépendances et lancer l’app.
-
-### 🐧 Linux/macOS (setup.sh)
-
+- **Windows** : double-cliquez sur `setup.bat`  
+- **Linux / macOS** :
 ```bash
 chmod +x setup.sh
 ./setup.sh
@@ -79,18 +71,27 @@ chmod +x setup.sh
 
 ---
 
+### 🧪 Test de connexion rapide (optionnel)
+
+Pour vérifier que la connexion à l’API fonctionne **sans lancer l’interface web** :
+```bash
+python quick_test.py
+```
+
+---
+
 ## ⚙️ Identité de l'application
 
-Par défaut, l’application utilise ces identifiants fixes :
+Par défaut, l’application s’identifie auprès de la Freebox avec :
 
 - **App ID** : `com.fase.app`  
 - **App Name** : `Freebox API Stats Exporter`  
-- **App Version** : `1.0`  
-- **Device Name** : `FASE-Client`  
+- **App Version** : `1.1`  
+- **Device Name** : `FASE-Client-Optimized`  
 
-👉 Ces valeurs sont suffisantes pour utiliser l’application.  
-Vous pouvez les modifier si vous voulez personnaliser l’identifiant ou différencier vos appareils.  
-⚠️ Attention : si vous changez **App ID** ou **Device Name**, la Freebox considérera qu’il s’agit d’une **nouvelle application** et vous devrez valider une nouvelle autorisation sur l’écran.
+👉 Vous pouvez modifier ces valeurs dans le code si vous souhaitez personnaliser l’identifiant.
+
+⚠️ **Attention** : si vous changez l’`App ID` ou le `Device Name`, la Freebox considérera qu’il s’agit d’une **nouvelle application** et demandera une nouvelle autorisation.
 
 ---
 
@@ -98,14 +99,16 @@ Vous pouvez les modifier si vous voulez personnaliser l’identifiant ou différ
 
 ```
 freebox-api-stats-exporter/
-├── app.py            # appli Streamlit principale
-├── quick_test.py     # script test connexion Freebox
-├── requirements.txt  # dépendances
-├── setup.sh          # script Linux/macOS
-├── setup.bat         # script Windows
-└── README.md         # ce tutoriel
+├── app.py              # Application Streamlit principale
+├── quick_test.py       # Script de test pour la connexion à l'API
+├── requirements.txt    # Dépendances Python
+├── setup.sh            # Script de lancement Linux/macOS
+├── setup.bat           # Script de lancement Windows
+└── README.md           # Cette documentation
 ```
+
+---
 
 ## 📜 Licence
 
-GPLv3 (comme [freebox-api](https://github.com/hacf-fr/freebox-api)).
+Ce projet est sous licence **GPLv3**, comme la bibliothèque `freebox-api` dont il dépend.
